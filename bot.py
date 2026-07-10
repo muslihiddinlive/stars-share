@@ -3,7 +3,10 @@ import os
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
     LabeledPrice,
@@ -11,6 +14,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ForceReply,
 )
 from aiogram.enums import ParseMode
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -42,7 +46,22 @@ BASE_WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL") or os.environ["BASE_WEB
 PORT = int(os.environ.get("PORT", 10000))
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
+
+
+class SendFlow(StatesGroup):
+    waiting_target = State()
+    waiting_amount = State()
+
+
+class TopupFlow(StatesGroup):
+    waiting_amount = State()
+
+
+def cancel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cx"),
+    ]])
 
 
 def fmt_user(user_id: int, username: str | None) -> str:
@@ -75,7 +94,11 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 
 def topup_kb() -> InlineKeyboardMarkup:
     row = [InlineKeyboardButton(text=f"{a} ⭐️", callback_data=f"topup:{a}") for a in TOPUP_PRESETS]
-    return InlineKeyboardMarkup(inline_keyboard=[row, [InlineKeyboardButton(text="⬅️ Menyu", callback_data="menu:home")]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        row,
+        [InlineKeyboardButton(text="✏️ Boshqa miqdor", callback_data="topup:custom")],
+        [InlineKeyboardButton(text="⬅️ Menyu", callback_data="menu:home")],
+    ])
 
 
 def confirm_kb(sender_id: int, target_id: int, amount: int) -> InlineKeyboardMarkup:
@@ -88,10 +111,11 @@ def confirm_kb(sender_id: int, target_id: int, amount: int) -> InlineKeyboardMar
 
 HELP_TEXT = (
     "⭐️ <b>Stars Share</b> ga xush kelibsiz!\n\n"
-    "/topup &lt;miqdor&gt; — hisobingizni to'ldirish\n"
-    "/balance — balansingizni ko'rish\n"
-    "/send &lt;@username yoki ID&gt; &lt;miqdor&gt; — stars o'tkazish\n\n"
-    "❗️ Qabul qiluvchi avval botga /start bosgan va kamida bir marta /topup qilgan bo'lishi kerak.\n"
+    "Pastdagi tugmalar orqali:\n"
+    "💼 Balans — joriy balansingizni ko'rasiz\n"
+    "💰 To'ldirish — hisobingizni Stars bilan to'ldirasiz\n"
+    "📤 Yuborish — boshqa foydalanuvchiga stars o'tkazasiz\n\n"
+    "❗️ Qabul qiluvchi avval botga start bosgan va kamida bir marta hisobini to'ldirgan bo'lishi kerak.\n"
     "Har bir o'tkazmadan 1 ⭐️ tizim ulushi olinadi — bu haqda hamma xabardor bo'ladi."
 )
 
@@ -126,26 +150,129 @@ async def menu_balance(cb: CallbackQuery):
 @dp.callback_query(F.data == "menu:topup")
 async def menu_topup(cb: CallbackQuery):
     await cb.message.edit_text(
-        "💰 Qancha stars bilan to'ldirmoqchisiz?\nBoshqa miqdor: <code>/topup 75</code>",
+        "💰 Qancha stars bilan to'ldirmoqchisiz?",
         reply_markup=topup_kb(),
     )
     await cb.answer()
 
 
 @dp.callback_query(F.data == "menu:send")
-async def menu_send(cb: CallbackQuery):
-    await cb.message.edit_text(
-        "📤 <code>/send @username 10</code> yoki <code>/send 123456789 10</code>\n"
-        "Yuborishdan oldin tasdiqlash so'raladi.",
-        reply_markup=main_menu_kb(),
+async def menu_send(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(SendFlow.waiting_target)
+    await cb.message.answer(
+        "📤 Kimga stars yubormoqchisiz?\n"
+        "Foydalanuvchi <b>username</b>i (@bilan) yoki <b>ID</b>sini yozib javob bering.",
+        reply_markup=ForceReply(selective=True),
     )
+    await cb.message.edit_reply_markup(reply_markup=cancel_kb())
     await cb.answer()
 
 
 @dp.callback_query(F.data.startswith("topup:"))
-async def topup_preset(cb: CallbackQuery):
-    await send_invoice_to(cb.from_user.id, int(cb.data.split(":")[1]))
+async def topup_preset(cb: CallbackQuery, state: FSMContext):
+    choice = cb.data.split(":")[1]
+    if choice == "custom":
+        await state.set_state(TopupFlow.waiting_amount)
+        await cb.message.answer("✏️ Necha ⭐️ bilan to'ldirmoqchisiz? Raqam bilan javob bering.", reply_markup=ForceReply(selective=True))
+        await cb.message.edit_reply_markup(reply_markup=cancel_kb())
+        await cb.answer()
+        return
+    await send_invoice_to(cb.from_user.id, int(choice))
     await cb.answer()
+
+
+@dp.message(StateFilter(TopupFlow.waiting_amount))
+async def topup_flow_amount(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text.isdigit() or int(text) <= 0:
+        await message.answer("Iltimos, musbat butun son yozing (masalan: 75).", reply_markup=cancel_kb())
+        return
+    await state.clear()
+    async with storage.state_lock:
+        storage.upsert_user(message.from_user.id, message.from_user.username)
+        await storage._persist(bot, STORAGE_CHAT_ID, STORAGE_TOPIC_ID)
+    await send_invoice_to(message.from_user.id, int(text))
+
+
+@dp.message(StateFilter(SendFlow.waiting_target))
+async def send_flow_target(message: Message, state: FSMContext):
+    target_raw = message.text.strip()
+    if target_raw.startswith("@"):
+        target = storage.get_user_by_username(target_raw)
+    elif target_raw.isdigit():
+        tid = int(target_raw)
+        u = storage.get_user(tid)
+        target = {"user_id": tid, **u} if u else None
+    else:
+        target = None
+
+    if not target:
+        await message.answer(
+            "❌ Bu foydalanuvchi topilmadi. U avval botga /start bosishi kerak.\n"
+            "Qayta urinib ko'ring yoki bekor qiling.",
+            reply_markup=cancel_kb(),
+        )
+        return
+    if target["user_id"] == message.from_user.id:
+        await message.answer("❌ O'zingizga stars o'tkaza olmaysiz. Boshqa username/ID yozing.", reply_markup=cancel_kb())
+        return
+    if not target["has_paid"]:
+        await message.answer("❌ Qabul qiluvchi hali /topup qilmagan. Boshqa username/ID yozing.", reply_markup=cancel_kb())
+        return
+
+    await state.update_data(target_id=target["user_id"], target_username=target["username"])
+    await state.set_state(SendFlow.waiting_amount)
+    target_tag = fmt_user(target["user_id"], target["username"])
+    row = [InlineKeyboardButton(text=f"{a} ⭐️", callback_data=f"sendamt:{a}") for a in TOPUP_PRESETS]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        row,
+        [InlineKeyboardButton(text="✏️ Boshqa miqdor", callback_data="sendamt:custom")],
+        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cx")],
+    ])
+    await message.answer(f"👤 Qabul qiluvchi: {target_tag}\nNecha ⭐️ yubormoqchisiz?", reply_markup=kb)
+
+
+@dp.callback_query(SendFlow.waiting_amount, F.data.startswith("sendamt:"))
+async def send_flow_amount_preset(cb: CallbackQuery, state: FSMContext):
+    choice = cb.data.split(":")[1]
+    if choice == "custom":
+        await cb.message.answer("✏️ Necha ⭐️? Raqam bilan javob bering.", reply_markup=ForceReply(selective=True))
+        await cb.message.edit_reply_markup(reply_markup=cancel_kb())
+        await cb.answer()
+        return
+    await finish_send_amount(cb.message, state, int(choice), cb.from_user)
+    await cb.answer()
+
+
+@dp.message(StateFilter(SendFlow.waiting_amount))
+async def send_flow_amount_text(message: Message, state: FSMContext):
+    if not message.text or not message.text.strip().isdigit():
+        await message.answer("Iltimos, faqat butun son yozing (masalan: 15).", reply_markup=cancel_kb())
+        return
+    await finish_send_amount(message, state, int(message.text.strip()), message.from_user)
+
+
+async def finish_send_amount(message: Message, state: FSMContext, amount: int, from_user):
+    if amount <= FEE:
+        await message.answer(f"Miqdor {FEE} dan katta bo'lishi kerak. Qayta yozing.", reply_markup=cancel_kb())
+        return
+    data = await state.get_data()
+    target_id = data["target_id"]
+    sender_id = from_user.id
+    sender = storage.get_user(sender_id)
+    if not sender or sender["balance"] < amount:
+        await message.answer("❌ Balansingiz yetarli emas.")
+        await state.clear()
+        return
+
+    net_amount = amount - FEE
+    target_tag = fmt_user(target_id, data.get("target_username"))
+    await state.clear()
+    await message.answer(
+        f"📤 <b>Tasdiqlang:</b>\n{amount} ⭐️ dan {net_amount} ⭐️ {target_tag} ga yuboriladi.\n"
+        f"🔹 {FEE} ⭐️ tizim ulushi.\n\nDavom etasizmi?",
+        reply_markup=confirm_kb(sender_id, target_id, amount),
+    )
 
 
 async def send_invoice_to(user_id: int, amount: int):
@@ -258,7 +385,8 @@ async def send_handler(message: Message):
 
 
 @dp.callback_query(F.data == "cx")
-async def cancel_send(cb: CallbackQuery):
+async def cancel_send(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
     await cb.message.edit_text("❌ Bekor qilindi.")
     await cb.answer()
 
