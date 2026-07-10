@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import os
 
@@ -14,6 +13,8 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 from aiogram.enums import ParseMode
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
 import storage
 
@@ -31,6 +32,14 @@ STORAGE_TOPIC_ID = int(os.environ["STORAGE_TOPIC_ID"]) if os.environ.get("STORAG
 
 FEE = 1
 TOPUP_PRESETS = [10, 25, 50, 100]
+
+# Webhook sozlamalari - Render Web Service portni kutadi, shuning uchun
+# polling emas, webhook orqali ishlaymiz.
+WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]  # o'zingiz random uzun satr o'ylab qo'ying
+WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
+# Render web service'lar uchun bu avtomatik o'rnatiladi (https://xxx.onrender.com)
+BASE_WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL") or os.environ["BASE_WEBHOOK_URL"]
+PORT = int(os.environ.get("PORT", 10000))
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -321,10 +330,40 @@ async def stats_handler(message: Message):
     )
 
 
-async def main():
+async def on_startup():
     await storage.load_state(bot, STORAGE_CHAT_ID, STORAGE_TOPIC_ID)
-    await dp.start_polling(bot)
+    webhook_url = BASE_WEBHOOK_URL.rstrip("/") + WEBHOOK_PATH
+    await bot.set_webhook(
+        webhook_url,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
+    )
+    log.info("Webhook o'rnatildi: %s", webhook_url)
+
+
+async def on_shutdown():
+    await bot.delete_webhook()
+    log.info("Webhook o'chirildi")
+
+
+def main():
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+
+    app = web.Application()
+    SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET).register(
+        app, path=WEBHOOK_PATH
+    )
+    setup_application(app, dp, bot=bot)
+
+    # Render port skanerini qanoatlantirish uchun oddiy health-check
+    async def health(request):
+        return web.Response(text="ok")
+
+    app.router.add_get("/", health)
+
+    web.run_app(app, host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
