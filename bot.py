@@ -342,8 +342,15 @@ async def on_startup():
 
 
 async def on_shutdown():
-    await bot.delete_webhook()
-    log.info("Webhook o'chirildi")
+    # DIQQAT: bu yerda bot.delete_webhook() chaqirilmaydi - ataylab.
+    # Render Free tier har safar 15 daqiqa harakatsizlikdan keyin service'ni
+    # to'xtatadi (SIGTERM yuboradi), bu esa on_shutdown'ni ishga tushiradi.
+    # Agar shu yerda webhook o'chirilsa, Telegram'da botga ulanish uchun
+    # umuman manzil qolmaydi va service HECH QACHON o'z-o'zidan uyg'onmaydi -
+    # faqat qo'lda qayta deploy qilinganda vaqtincha ishlaydi. Webhook
+    # Telegram tomonida saqlanib qolishi kerak, u holda keyingi kiruvchi
+    # update service'ni tabiiy tarzda "uyg'otadi".
+    log.info("Process to'xtayapti (webhook saqlanib qoladi)")
 
 
 def main():
